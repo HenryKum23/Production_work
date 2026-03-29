@@ -1,0 +1,142 @@
+# =============================================================
+# Workflow:     deploy.yml
+# Description:  CI/CD pipeline — test, build, deploy to AWS
+# Author:       Henry Kumah
+# Triggers:     Push to main branch
+# =============================================================
+
+name: Deploy to Production
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: eu-west-1
+  PYTHON_VERSION: "3.11"
+
+jobs:
+
+  # ── Stage 1: Test & Validate ─────────────────────────────────
+  test:
+    name: Test & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest flake8
+
+      - name: Lint Python scripts
+        run: flake8 scripts/
+
+      - name: Validate Bash scripts
+        run: |
+          sudo apt-get install -y shellcheck
+          shellcheck scripts/bootstrap.sh
+
+      - name: Run unit tests
+        run: pytest tests/ -v
+
+  # ── Stage 2: Build & Push ────────────────────────────────────
+  build:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/hfm-app:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/hfm-app:$IMAGE_TAG
+
+  # ── Stage 3: Deploy ──────────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run disk maintenance
+        run: python3 scripts/disk_maintenance.py
+
+      - name: Deploy new image to ECS
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          aws ecs update-service \
+            --cluster prod-cluster \
+            --service hfm-app \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for deployment to stabilise
+        run: |
+          aws ecs wait services-stable \
+            --cluster prod-cluster \
+            --services hfm-app \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Notify team — success
+        if: success()
+        run: |
+          aws sns publish \
+            --topic-arn ${{ secrets.SNS_TOPIC_ARN }} \
+            --message "Deployment successful — commit ${{ github.sha }}" \
+            --subject "Deploy Success" \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Notify team — failure
+        if: failure()
+        run: |
+          aws sns publish \
+            --topic-arn ${{ secrets.SNS_TOPIC_ARN }} \
+            --message "DEPLOYMENT FAILED — commit ${{ github.sha }} — check pipeline logs at ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --subject "Deploy FAILED" \
+            --region ${{ env.AWS_REGION }}
