@@ -106,6 +106,8 @@ echo "      ECR repository created: $ECR_URI"
 # ── Step 4: Launch EC2 instance ───────────────────────────────
 echo ""
 echo "[4/4] Launching EC2 instance..."
+echo "      bootstrap.sh will run automatically on first boot via user-data."
+echo "      No manual SSH required to configure the server."
 
 INSTANCE_ID=$(aws ec2 run-instances \
   --image-id "$AMI_ID" \
@@ -113,6 +115,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --key-name "$KEY_PAIR_NAME" \
   --security-group-ids "$SECURITY_GROUP_ID" \
   --subnet-id "$SUBNET_ID" \
+  --user-data file://scripts/bootstrap.sh \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$SERVER_NAME}]" \
   --region "$AWS_REGION" \
   --query 'Instances[0].InstanceId' \
@@ -131,8 +134,9 @@ PUBLIC_IP=$(aws ec2 describe-instances \
   --output text \
   --region "$AWS_REGION")
 
-echo "      Instance is running."
-echo "      Public IP: $PUBLIC_IP"
+echo "      Instance is running at: $PUBLIC_IP"
+echo "      bootstrap.sh is executing in the background on first boot."
+echo "      Allow 2-3 minutes for bootstrapping to complete before deploying."
 
 # ── Summary ───────────────────────────────────────────────────
 echo ""
@@ -147,10 +151,16 @@ echo " Public IP      : $PUBLIC_IP"
 echo "============================================================"
 echo " Next steps:"
 echo "   1. Confirm the SNS email subscription in your inbox"
-echo "   2. Add SNS_TOPIC_ARN to GitHub Secrets (see README Section 9)"
-echo "   3. Run bootstrap.sh on the EC2 instance:"
-echo "      scp scripts/bootstrap.sh ubuntu@$PUBLIC_IP:/home/ubuntu/"
-echo "      ssh ubuntu@$PUBLIC_IP 'sudo bash bootstrap.sh'"
+echo "   2. Add these values to GitHub Secrets (see README Section 9):"
+echo "      EC2_PUBLIC_IP = $PUBLIC_IP"
+echo "      SNS_TOPIC_ARN = $SNS_TOPIC_ARN"
+echo "   3. Wait 2-3 mins for bootstrap.sh to finish on the server"
+echo "   4. Push code to main branch to trigger the pipeline"
+echo "   5. Visit http://$PUBLIC_IP in your browser after deploy"
 echo "============================================================"
 echo ""
-echo " Full log saved to: $LOG"
+echo " To verify bootstrap completed on the server:"
+echo "   ssh -i ~/.ssh/$KEY_PAIR_NAME.pem ubuntu@$PUBLIC_IP"
+echo "   sudo cat /var/log/bootstrap.log"
+echo ""
+echo " Full setup log saved to: $LOG"

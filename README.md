@@ -2,7 +2,7 @@
 
 > **Author:** Henry Kumah  
 > **Purpose:** Demonstrates production-grade automation using Bash, Python, and GitHub Actions on AWS  
-> **Stack:** AWS (EC2, SNS, Secrets Manager, ECR, ECS), GitHub Actions, Docker, Nginx  
+> **Stack:** AWS (EC2, SNS, Secrets Manager, ECR), GitHub Actions, Docker, Nginx  
 > **Last Updated:** March 2026
 
 ---
@@ -64,24 +64,30 @@ Developer pushes to main branch
                  ▼
   ┌─────────────────────────────────────┐
   │  Stage 3: Deploy                    │
-  │  - Run bootstrap.sh on new servers  │
   │  - Run disk_maintenance.py          │
-  │  - Deploy new image to ECS          │
-  │  - Wait for stable health           │
+  │  - SSH into EC2                     │
+  │  - Pull new image from ECR          │
+  │  - Restart Docker container         │
+  │  - Verify app is responding         │
   │  - Notify team via SNS              │
   └─────────────────────────────────────┘
 
 AWS Infrastructure
-  ┌──────────────────────────────────────────┐
-  │  VPC                                     │
-  │  ┌─────────────┐   ┌──────────────────┐  │
-  │  │ Public      │   │ Private Subnet   │  │
-  │  │ Subnet      │   │                  │  │
-  │  │  ALB        │──▶│  EC2 / ECS       │  │
-  │  └─────────────┘   └──────────────────┘  │
-  │                                          │
-  │  ECR ── Secrets Manager ── SNS           │
-  └──────────────────────────────────────────┘
+  ┌──────────────────────────────────────────────────┐
+  │  EC2 Instance                                    │
+  │                                                  │
+  │  On first boot (via user-data):                  │
+  │    bootstrap.sh runs automatically —             │
+  │    installs Nginx, configures firewall,          │
+  │    fetches secret, creates app user              │
+  │                                                  │
+  │  On every deploy (via pipeline):                 │
+  │    Browser → port 80 → Nginx → port 8080 →       │
+  │                            Docker container      │
+  │                            (pulled from ECR)     │
+  │                                                  │
+  │  ECR ── Secrets Manager ── SNS                   │
+  └──────────────────────────────────────────────────┘
 ```
 
 ---
@@ -103,7 +109,6 @@ AWS Infrastructure
   - `secretsmanager:GetSecretValue`
   - `sns:Publish`
   - `ecr:*`
-  - `ecs:*`
 - An existing VPC with at least one public and one private subnet
 - An EC2 key pair for SSH access
 
@@ -131,17 +136,19 @@ Expected output:
 .
 ├── .github/
 │   └── workflows/
-│       └── deploy.yml          # CI/CD pipeline definition
+│       └── deploy.yml              # CI/CD pipeline definition
 ├── scripts/
-│   ├── aws_setup.sh            # One-command AWS resource provisioning
-│   ├── bootstrap.sh            # Server configuration script
-│   └── disk_maintenance.py     # Nightly disk cleanup and alerting
+│   ├── __init__.py                 # makes scripts/ a Python package
+│   ├── aws_setup.sh                # one-command AWS resource provisioning
+│   ├── bootstrap.sh                # server configuration — runs via EC2 user-data
+│   └── disk_maintenance.py         # nightly disk cleanup and alerting
 ├── tests/
-│   └── test_disk_maintenance.py  # Unit tests for Python script
+│   ├── __init__.py                 # makes tests/ a Python package
+│   └── test_disk_maintenance.py    # unit tests for disk_maintenance.py
 ├── app/
-│   └── Dockerfile              # Application container definition
-├── requirements.txt            # Python dependencies
-└── README.md                   # This file
+│   └── Dockerfile                  # application container definition
+├── requirements.txt                # Python dependencies
+└── README.md                       # this file
 ```
 
 ---
@@ -154,6 +161,8 @@ Rather than running individual CLI commands for each resource, all four AWS setu
 > Running individual CLI commands manually is error-prone — you might miss a step, use a wrong value, or be unable to reproduce the setup later. A script captures every step in order, validates each one succeeded before continuing, logs the output, and can be re-run safely on a fresh environment.
 
 > **On the Secrets Manager step:** This project contains no real application credentials. A demo placeholder value is stored in Secrets Manager solely to demonstrate the production pattern of fetching secrets at runtime rather than hardcoding them in scripts. The full explanation lives in the script header comments. In a real deployment you would replace the placeholder with an actual credential — an API key, a service token, a password — whatever your application needs. The fetch mechanism in `bootstrap.sh` remains identical regardless of what the secret contains.
+
+> **On bootstrap.sh:** The setup script passes `bootstrap.sh` to the EC2 instance via the `--user-data` flag at launch time. This means `bootstrap.sh` runs automatically on first boot — no manual SSH required. By the time `aws_setup.sh` finishes, the server is already configuring itself in the background.
 
 ---
 
@@ -200,7 +209,6 @@ SERVER_NAME="prod-server-01"
 # access token — depending on what your application needs.
 # The fetch pattern in bootstrap.sh remains identical regardless
 # of what the secret contains.
-
 SECRET_NAME="prod/app/secret"
 SECRET_VALUE="demo-placeholder-value"
 
@@ -320,7 +328,7 @@ echo "============================================================"
 echo ""
 echo " Full log saved to: $LOG"
 ```
-This file is exactly the same as aws_setup.sh under the /production/scripts/aws_setup.sh
+
 ---
 
 ### How to run it
@@ -367,7 +375,7 @@ Copy the SNS Topic ARN from this output — you will need it in the GitHub Secre
 
 **File:** `scripts/bootstrap.sh`
 
-This script is designed to run once on a fresh EC2 instance. It takes a bare Ubuntu server and transforms it into a fully configured, secured, production-ready application server in a single execution.
+This script runs automatically on first boot via EC2 user-data — passed to the instance at launch time by `aws_setup.sh`. It takes a bare Ubuntu server and transforms it into a fully configured, secured, production-ready server in a single execution. No manual SSH is required.
 
 ### What it does
 
@@ -385,12 +393,19 @@ This script is designed to run once on a fresh EC2 instance. It takes a bare Ubu
 #!/bin/bash
 # =============================================================
 # Script:       bootstrap.sh
-# Description:  Provisions and configures a fresh Ubuntu EC2 server
+# Description:  Configures a fresh Ubuntu EC2 server —
+#               installs packages, creates app user, fetches
+#               secret, configures Nginx, sets firewall rules.
+#               Runs automatically on first boot via EC2
+#               user-data passed by aws_setup.sh at launch time.
+#               No manual SSH required.
 # Author:       Henry Kumah
 # Created:      2026-03-01
-# Version:      1.0
-# Usage:        sudo bash bootstrap.sh
-# Dependencies: AWS CLI configured with appropriate IAM permissions
+# Version:      1.1
+# Usage:        Automatic via EC2 user-data (see aws_setup.sh)
+#               Manual fallback: sudo bash bootstrap.sh
+# Dependencies: AWS CLI configured with appropriate IAM
+#               permissions (secretsmanager:GetSecretValue)
 # =============================================================
 
 set -euo pipefail
@@ -406,20 +421,28 @@ apt-get update -y && apt-get upgrade -y
 
 # ── 2. Install packages ───────────────────────────────────────
 echo "[2/6] Installing required packages..."
-apt-get install -y nginx postgresql-client awscli curl unzip
+apt-get install -y nginx awscli curl unzip docker.io
+
+# Enable Docker so it starts on reboot
+systemctl enable docker
+systemctl start docker
 
 # ── 3. Create application user ────────────────────────────────
 echo "[3/6] Creating application user..."
 useradd --system --no-create-home --shell /usr/sbin/nologin appuser
 
-# ── 4. Fetch demo secret from AWS Secrets Manager ────────────
+# Add ubuntu user to docker group so pipeline SSH deploys can run docker
+usermod -aG docker ubuntu
+
+# ── 4. Fetch demo secret from AWS Secrets Manager ─────────────
 # This project contains no real application credentials.
 # This step demonstrates the production pattern of fetching a
-# secret at runtime. In a real deployment, replace SECRET_NAME
-# with your actual secret path and use the fetched value where
-# your application needs it (e.g. passed as an env variable to
-# a service). The fetch mechanism is identical regardless of
-# what the secret contains.
+# secret at runtime. In a real deployment, replace the secret
+# path with your actual secret and use the fetched value where
+# your application needs it — for example, passed as an
+# environment variable to a Docker container on startup.
+# The fetch mechanism is identical regardless of what the
+# secret contains.
 echo "[4/6] Fetching secret from AWS Secrets Manager..."
 APP_SECRET=$(aws secretsmanager get-secret-value \
   --secret-id prod/app/secret \
@@ -429,6 +452,8 @@ APP_SECRET=$(aws secretsmanager get-secret-value \
 echo "      Secret fetched successfully."
 
 # ── 5. Configure Nginx ────────────────────────────────────────
+# Nginx listens on port 80 and proxies all traffic to the
+# Docker container running on port 8080 on the same server.
 echo "[5/6] Configuring Nginx..."
 cat > /etc/nginx/sites-available/app.conf << EOF
 server {
@@ -444,6 +469,8 @@ ln -sf /etc/nginx/sites-available/app.conf /etc/nginx/sites-enabled/
 nginx -t && systemctl enable nginx && systemctl restart nginx
 
 # ── 6. Configure firewall ─────────────────────────────────────
+# Only ports 22 (SSH), 80 (HTTP), and 443 (HTTPS) are open.
+# Everything else is blocked by default.
 echo "[6/6] Configuring firewall..."
 ufw allow 22/tcp
 ufw allow 80/tcp
@@ -453,18 +480,19 @@ ufw --force enable
 echo "=== Bootstrap complete: $(date) ==="
 ```
 
-### How to run it on your EC2 instance
+### How it runs
 
-Copy the script to the server and execute it:
+`bootstrap.sh` is passed to the EC2 instance via the `--user-data` flag in `aws_setup.sh` at launch time. AWS automatically executes it as root on the first boot. You do not need to SSH in or run anything manually.
 
 ```bash
-# Copy script to server
-scp -i ~/.ssh/your-key.pem scripts/bootstrap.sh ubuntu@<EC2-PUBLIC-IP>:/home/ubuntu/
+# This flag in aws_setup.sh is what triggers bootstrap.sh on first boot
+--user-data file://scripts/bootstrap.sh
+```
 
-# SSH into the server
+If you ever need to run it manually as a fallback — for example on a replacement server:
+
+```bash
 ssh -i ~/.ssh/your-key.pem ubuntu@<EC2-PUBLIC-IP>
-
-# Run the bootstrap script
 sudo bash bootstrap.sh
 ```
 
@@ -585,6 +613,8 @@ pip install -r requirements.txt
 `requirements.txt`:
 ```
 boto3==1.34.0
+pytest==8.1.0
+flake8==7.0.0
 ```
 
 ### Schedule it with cron (runs every night at 2am)
@@ -715,6 +745,10 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
@@ -726,29 +760,58 @@ jobs:
       - name: Run disk maintenance
         run: python3 scripts/disk_maintenance.py
 
-      - name: Deploy new image to ECS
+      - name: Deploy new image to EC2
         env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          aws ecs update-service \
-            --cluster prod-cluster \
-            --service hfm-app \
-            --force-new-deployment \
-            --region ${{ env.AWS_REGION }}
+          # Write the SSH private key to a temp file
+          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/deploy-key.pem
+          chmod 600 /tmp/deploy-key.pem
 
-      - name: Wait for deployment to stabilise
+          # SSH into the EC2 instance and deploy the new container
+          ssh -o StrictHostKeyChecking=no \
+              -i /tmp/deploy-key.pem \
+              ubuntu@${{ secrets.EC2_PUBLIC_IP }} << EOF
+            # Pull the latest image from ECR
+            aws ecr get-login-password --region ${{ env.AWS_REGION }} | \
+              docker login --username AWS --password-stdin $ECR_REGISTRY
+
+            docker pull $ECR_REGISTRY/hfm-app:$IMAGE_TAG
+
+            # Stop and remove the old container if running
+            docker stop hfm-app || true
+            docker rm hfm-app || true
+
+            # Start the new container on port 8080
+            # Nginx on port 80 proxies traffic to this container
+            docker run -d \
+              --name hfm-app \
+              --restart always \
+              -p 8080:8080 \
+              $ECR_REGISTRY/hfm-app:$IMAGE_TAG
+
+            echo "Container deployed successfully"
+            docker ps | grep hfm-app
+          EOF
+
+          # Clean up key file
+          rm -f /tmp/deploy-key.pem
+
+      - name: Verify app is responding
         run: |
-          aws ecs wait services-stable \
-            --cluster prod-cluster \
-            --services hfm-app \
-            --region ${{ env.AWS_REGION }}
+          sleep 10
+          curl --fail --silent --max-time 10 \
+            http://${{ secrets.EC2_PUBLIC_IP }} \
+            && echo "App is up and responding on port 80" \
+            || echo "WARNING: App did not respond — check container logs"
 
       - name: Notify team — success
         if: success()
         run: |
           aws sns publish \
             --topic-arn ${{ secrets.SNS_TOPIC_ARN }} \
-            --message "Deployment successful — commit ${{ github.sha }}" \
+            --message "Deployment successful — commit ${{ github.sha }} — app live at http://${{ secrets.EC2_PUBLIC_IP }}" \
             --subject "Deploy Success" \
             --region ${{ env.AWS_REGION }}
 
@@ -776,7 +839,9 @@ Add the following secrets:
 |---|---|---|
 | `AWS_ACCESS_KEY_ID` | Your IAM access key | AWS Console → IAM → Users → Security credentials |
 | `AWS_SECRET_ACCESS_KEY` | Your IAM secret key | Same as above — only shown once at creation |
-| `SNS_TOPIC_ARN` | Your SNS topic ARN | Output from Step 1 in AWS Setup |
+| `SNS_TOPIC_ARN` | Your SNS topic ARN | Printed in `aws_setup.sh` summary output |
+| `EC2_PUBLIC_IP` | Your EC2 instance public IP | Printed in `aws_setup.sh` summary output |
+| `EC2_SSH_KEY` | Contents of your `.pem` key file | Open the file and paste the entire contents including the header and footer lines |
 
 ---
 
@@ -784,25 +849,69 @@ Add the following secrets:
 
 Before pushing to GitHub, always test scripts locally first.
 
-### Test the Python script
+### Unit tests — what is tested and why
+
+Only `disk_maintenance.py` has unit tests. The Bash scripts (`bootstrap.sh`, `aws_setup.sh`) are validated by `shellcheck` in the pipeline instead — you cannot meaningfully unit test scripts that provision real servers and AWS resources without those things actually existing.
+
+The three functions tested are:
+
+| Function | What is tested |
+|---|---|
+| `get_disk_usage_percent()` | Returns a float between 0 and 100 |
+| `delete_old_logs()` | Deletes old files, leaves recent ones, handles empty directories |
+| `send_alert()` | Calls SNS publish with correct parameters without raising exceptions |
+
+### Required `__init__.py` files
+
+Python needs these two empty files to resolve imports correctly when running pytest:
 
 ```bash
-# Install dependencies
+# Create them — both are empty files
+touch scripts/__init__.py
+touch tests/__init__.py
+```
+
+Without these, `from scripts.disk_maintenance import ...` inside the test file will fail with a `ModuleNotFoundError`.
+
+### Install dependencies
+
+```bash
 pip install -r requirements.txt
-
-# Create a test log directory with some old dummy files
-mkdir -p /tmp/test-logs
-touch -d "40 days ago" /tmp/test-logs/old_app.log
-touch -d "5 days ago" /tmp/test-logs/recent_app.log
-
-# Run the script (edit LOGS_DIR temporarily to /tmp/test-logs)
-python3 scripts/disk_maintenance.py
+pip install pytest
 ```
 
 ### Run unit tests
 
 ```bash
 pytest tests/ -v
+```
+
+Expected output:
+
+```
+tests/test_disk_maintenance.py::test_disk_usage_returns_a_percentage       PASSED
+tests/test_disk_maintenance.py::test_disk_usage_returns_float               PASSED
+tests/test_disk_maintenance.py::test_old_files_are_deleted                  PASSED
+tests/test_disk_maintenance.py::test_recent_files_are_not_deleted           PASSED
+tests/test_disk_maintenance.py::test_only_old_files_deleted_when_mixed      PASSED
+tests/test_disk_maintenance.py::test_empty_directory_returns_zero           PASSED
+tests/test_disk_maintenance.py::test_send_alert_calls_sns_publish           PASSED
+tests/test_disk_maintenance.py::test_send_alert_does_not_raise_on_success   PASSED
+
+8 passed in 0.42s
+```
+
+### Test the Python maintenance script manually
+
+```bash
+# Create a test log directory with dummy files at different ages
+mkdir -p /tmp/test-logs
+touch -d "40 days ago" /tmp/test-logs/old_app.log
+touch -d "5 days ago" /tmp/test-logs/recent_app.log
+
+# Temporarily edit LOGS_DIR in disk_maintenance.py to /tmp/test-logs
+# then run it
+python3 scripts/disk_maintenance.py
 ```
 
 ### Lint Python
@@ -815,6 +924,7 @@ flake8 scripts/
 
 ```bash
 shellcheck scripts/bootstrap.sh
+shellcheck scripts/aws_setup.sh
 ```
 
 ---
@@ -839,14 +949,18 @@ bash scripts/aws_setup.sh
 
 **Step 3** — Update the constants in `disk_maintenance.py` with your actual SNS ARN and region.
 
-**Step 4** — Add GitHub Secrets (Section 9).
+**Step 4** — Add GitHub Secrets (Section 9). Use the values printed in the `aws_setup.sh` summary output.
 
-**Step 5** — Bootstrap your EC2 instance manually for the first time:
+**Step 5** — Wait 2-3 minutes for `bootstrap.sh` to finish running on the EC2 instance via user-data. You can verify it completed successfully by SSHing in and checking the log:
 
 ```bash
-scp -i ~/.ssh/your-key.pem scripts/bootstrap.sh ubuntu@<EC2-IP>:/home/ubuntu/
-ssh -i ~/.ssh/your-key.pem ubuntu@<EC2-IP>
-sudo bash bootstrap.sh
+ssh -i ~/.ssh/your-key.pem ubuntu@<EC2-PUBLIC-IP>
+sudo cat /var/log/bootstrap.log
+```
+
+The last line should read:
+```
+=== Bootstrap complete: <timestamp> ===
 ```
 
 **Step 6** — Push code to trigger the pipeline:
@@ -863,7 +977,9 @@ Go to your repository → **Actions** tab → click the running workflow.
 
 You will see all three stages run sequentially. Green ticks mean success.
 
-**Step 8** — Check your email for the SNS success notification.
+**Step 8** — Open a browser and visit `http://<EC2-PUBLIC-IP>` — you should see the app running. Nginx on port 80 is proxying traffic to the Docker container on port 8080.
+
+**Step 9** — Check your email for the SNS success notification.
 
 ---
 
@@ -874,7 +990,8 @@ You will see all three stages run sequentially. Green ticks mean success.
 | Disk usage > 80% | `disk_maintenance.py` nightly cron | SNS email |
 | Deployment success/failure | GitHub Actions `if: success()` / `if: failure()` | SNS email |
 | Nginx service health | `systemctl status nginx` | Manual / CloudWatch |
-| EC2 instance health | AWS ECS health checks | AWS Console |
+| Docker container health | `docker ps` on EC2 | Manual / CloudWatch |
+| App availability | `curl` health check in pipeline | Pipeline logs + SNS |
 
 To add CloudWatch alarms for CPU or memory:
 
@@ -899,15 +1016,23 @@ aws cloudwatch put-metric-alarm \
 
 ### Bootstrap script fails
 
+`bootstrap.sh` runs automatically via EC2 user-data on first boot. To check if it ran successfully:
+
 ```bash
-# Check the log for the exact error
+# SSH into the server
+ssh -i ~/.ssh/your-key.pem ubuntu@<EC2-PUBLIC-IP>
+
+# Check the bootstrap log
 sudo cat /var/log/bootstrap.log
 
-# Most common cause: IAM permissions
-# Verify the EC2 instance role has secretsmanager:GetSecretValue
+# Most common cause of failure: IAM permissions
+# The EC2 instance role must have secretsmanager:GetSecretValue
 aws iam simulate-principal-policy \
   --policy-source-arn arn:aws:iam::123456789012:role/ec2-role \
   --action-names secretsmanager:GetSecretValue
+
+# You can also check the raw user-data log from cloud-init
+sudo cat /var/log/cloud-init-output.log
 ```
 
 ### Python script cannot connect to SNS
@@ -927,6 +1052,23 @@ aws sns publish \
 
 - Double-check that `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are added correctly in GitHub Secrets (no spaces, no quotes around the value).
 - Verify the IAM user has the required permissions.
+
+### Docker container not running after deploy
+
+```bash
+# SSH into the EC2 instance
+ssh -i ~/.ssh/your-key.pem ubuntu@<EC2-PUBLIC-IP>
+
+# Check if the container is running
+docker ps
+
+# Check container logs for errors
+docker logs hfm-app
+
+# Check Nginx is proxying correctly
+curl http://localhost:8080
+curl http://localhost:80
+```
 
 ### Nginx fails to start after bootstrap
 
@@ -955,3 +1097,13 @@ sudo journalctl -u nginx --no-pager -n 50
 
 **Henry Kumah** — DevOps & Platform Engineer  
 Belgrade, Serbia | [linkedin.com/in/henry-kumah](https://linkedin.com/in/henry-kumah) | [github.com/HenryKum23](https://github.com/HenryKum23)
+
+
+<!-- aws_setup.sh provisions EC2
+  → bootstrap.sh runs via user-data, installs Docker + Nginx
+  → pipeline builds main.py into a Docker image
+  → pushes image to ECR
+  → SSHes into EC2, pulls image, runs container on port 8080
+  → Nginx proxies port 80 to port 8080
+  → curl hits /health to verify
+  → browser visits port 80 and sees the HTML page -->
