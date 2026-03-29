@@ -3,10 +3,11 @@
 # Description:  CI/CD pipeline — test, build, deploy to AWS EC2
 # Author:       Henry Kumah
 # Created:      2026-03-01
-# Version:      1.1
+# Version:      1.2
 # Triggers:     Push to main branch
 # Flow:         Test & Validate → Build & Push to ECR →
-#               Deploy to EC2 via SSH → Verify → Notify
+#               Sync maintenance scripts → Deploy container →
+#               Verify → Notify
 # =============================================================
 
 name: Deploy to Production
@@ -49,6 +50,8 @@ jobs:
           sudo apt-get install -y shellcheck
           shellcheck scripts/bootstrap.sh
           shellcheck scripts/aws_setup.sh
+          shellcheck scripts/log_rotation.sh
+          shellcheck scripts/backup.sh
 
       - name: Run unit tests
         run: pytest tests/ -v
@@ -115,15 +118,31 @@ jobs:
       - name: Run disk maintenance
         run: python3 scripts/disk_maintenance.py
 
+      - name: Sync maintenance scripts to EC2
+        run: |
+          # Write SSH key
+          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/deploy-key.pem
+          chmod 600 /tmp/deploy-key.pem
+
+          # Copy all maintenance scripts to /opt/scripts on the server.
+          # This ensures the server always has the latest version of every
+          # script after each deployment. Cron picks up the updated files
+          # automatically on its next scheduled run — no restart needed.
+          scp -o StrictHostKeyChecking=no \
+              -i /tmp/deploy-key.pem \
+              scripts/disk_maintenance.py \
+              scripts/log_rotation.sh \
+              scripts/backup.sh \
+              ubuntu@${{ secrets.EC2_PUBLIC_IP }}:/opt/scripts/
+
+          echo "Maintenance scripts synced to /opt/scripts/"
+
       - name: Deploy new image to EC2
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          # Write the SSH private key to a temp file
-          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/deploy-key.pem
-          chmod 600 /tmp/deploy-key.pem
-
+          # SSH key already written in sync step above
           # SSH into the EC2 instance and deploy the new container
           ssh -o StrictHostKeyChecking=no \
               -i /tmp/deploy-key.pem \
