@@ -119,15 +119,21 @@ jobs:
         run: python3 scripts/disk_maintenance.py
 
       - name: Sync maintenance scripts to EC2
+        # Only runs when at least one maintenance script has changed
+        # in this commit. If only app code changed, this step is
+        # skipped entirely — no unnecessary file copies to the server.
+        if: |
+          contains(github.event.head_commit.modified, 'scripts/disk_maintenance.py') ||
+          contains(github.event.head_commit.modified, 'scripts/log_rotation.sh') ||
+          contains(github.event.head_commit.modified, 'scripts/backup.sh')
         run: |
           # Write SSH key
           echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/deploy-key.pem
           chmod 600 /tmp/deploy-key.pem
 
           # Copy all maintenance scripts to /opt/scripts on the server.
-          # This ensures the server always has the latest version of every
-          # script after each deployment. Cron picks up the updated files
-          # automatically on its next scheduled run — no restart needed.
+          # Cron picks up the updated files automatically on its next
+          # scheduled run — no restart needed.
           scp -o StrictHostKeyChecking=no \
               -i /tmp/deploy-key.pem \
               scripts/disk_maintenance.py \
@@ -142,7 +148,11 @@ jobs:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          # SSH key already written in sync step above
+          # Write SSH key — done here independently because the sync
+          # step above may have been skipped if no scripts changed
+          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/deploy-key.pem
+          chmod 600 /tmp/deploy-key.pem
+
           # SSH into the EC2 instance and deploy the new container
           ssh -o StrictHostKeyChecking=no \
               -i /tmp/deploy-key.pem \
